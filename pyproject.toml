@@ -6,13 +6,19 @@ readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "bacpipe>=1.2.0",
-    "datasets>=3.0.0",
     "ipykernel>=7.1.0",
     "soundfile>=0.12.1",
+    # tensorflow-intel provides the actual TensorFlow package on Windows
+    "tensorflow-intel==2.15.1; sys_platform == 'win32'",
 ]
 
 [tool.uv]
-# Override transitive dependency to only install on Linux (no Windows wheels available)
+# Override transitive dependencies for cross-platform compatibility
 override-dependencies = [
+    # tensorflow-io-gcs-filesystem has no Windows wheels - skip entirely on non-Linux
     "tensorflow-io-gcs-filesystem>=0.37.1; sys_platform == 'linux'",
+    # tensorflow-io also lacks Windows support
+    "tensorflow-io>=0.37.1; sys_platform == 'linux'",
+    "pyarrow>=21.0.0",
+    "fsspec>=2024.9.0,<2025.4.0",
 ]

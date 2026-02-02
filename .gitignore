@@ -1,3 +1,5 @@
+.vscode
+
 # Python-generated files
 __pycache__/
 *.py[oc]
@@ -12,3 +14,8 @@ wheels/
 # Bacpipe
 bacpipe/
 bacpipe_results/
+HSN_train_shard_0001/
+HSN_BASEAL/
+
+# Dataset
+HSN/HSN_train_shard_0001.tar.gz
