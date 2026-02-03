@@ -174,6 +174,11 @@ def split_row_into_segments(
 
         # Generate segment filename
         segment_filename = f"{stem}_{int(seg_start):03d}_{int(seg_end):03d}.wav"
+        print("===")
+        print(num_segments)
+        print(f"start/end: {seg_start}, {seg_end}")
+        print(segment_filename)
+        print("===")
 
         # Find overlapping events
         overlapping_event_indices = get_events_in_segment(events, seg_start, seg_end, config)
@@ -394,7 +399,7 @@ def split_row_into_segments_with_adapter(
             num_segments = int(np.ceil(file_length / config.segment_duration))
             for i in range(num_segments):
                 seg_start = i * config.segment_duration
-                seg_end = min(seg_start + config.segment_duration, file_length)
+                seg_end = seg_start + config.segment_duration
 
                 segment_filename = f"{stem}_{int(seg_start):03d}_{int(seg_end):03d}.wav"
                 segment_data = {
