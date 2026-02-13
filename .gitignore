@@ -23,3 +23,9 @@ ESC50/audio
 
 # Generated output
 ESC50_BASEAL/
+
+*.zip
+*.rar
+*.zst
+*.tar
+*.tar.gz
