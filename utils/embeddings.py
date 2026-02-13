@@ -21,15 +21,22 @@ logging.getLogger('bacpipe').setLevel(logging.ERROR)
 
 import bacpipe
 from bacpipe.generate_embeddings import Embedder
+from tqdm.auto import tqdm
 from pathlib import Path
 import numpy as np
-import shutil
-import torchaudio as ta
+import torch
+import soundfile as sf
+
+logger = logging.getLogger(__name__)
 
 # Re-export Embedder for type hints
 __all__ = ['initialise', 'generate_embeddings', 'Embedder']
 
-def initialise(model_name: str = 'birdnet') -> Embedder:
+
+def initialise(
+    model_name: str = 'birdnet',
+    run_pretrained_classifier: bool = False,
+) -> Embedder:
     # Download model checkpoint if needed
     bacpipe.ensure_models_exist(
         model_base_path=Path(bacpipe.settings.model_base_path),
@@ -38,15 +45,20 @@ def initialise(model_name: str = 'birdnet') -> Embedder:
 
     # Initialize the embedder with model
     # Pass all settings as kwargs (model_utils_base_path is set internally from package)
+    tmp_dict = vars(bacpipe.settings) | {
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+    }
+    if "perch_v2" in model_name:
+        tmp_dict["run_pretrained_classifier"] = run_pretrained_classifier
     embedder = Embedder(
         model_name=model_name,
-        **vars(bacpipe.settings),
+        **tmp_dict,
     )
 
     print(f"Model: {model_name}")
     print(f"Sample rate: {embedder.model.sr} Hz")
     print(f"Segment length: {embedder.model.segment_length} samples "
-            f"({embedder.model.segment_length / embedder.model.sr:.1f}s)")
+          f"({embedder.model.segment_length / embedder.model.sr:.1f}s)")
     return embedder
 
 
@@ -56,11 +68,14 @@ def generate_embeddings(
     model_name: str = "birdnet",
     output_dir: str | Path = "embeddings_output",
     segments_dir: str | Path = "test_segments",
-) -> dict:
+    save_segments: bool = True,
+) -> list[str]:
     """
     Generate segments and embeddings from multilength audio files.
 
-    Audio is automatically segmented based on model requirements for example BirdNet: 3-second windows at 48kHz (144000 samples)
+    Audio is automatically segmented based on model requirements for example
+    BirdNet: 3-second windows at 48kHz (144000 samples). Saved audio segments
+    preserve each source file's original sampling rate.
 
     Parameters
     ----------
@@ -72,70 +87,94 @@ def generate_embeddings(
         Directory to save embeddings
     segments_dir : str or Path
         Directory to save audio segments
+    save_segments : bool
+        Whether to save segmented audio files to segments_dir
 
     Returns
     -------
-    dict
-        Dictionary mapping audio filenames to their embedding arrays
+    list[str]
+        List of processed audio filenames.
     """
     audio_dir = Path(audio_dir)
     output_dir = Path(output_dir)
     segments_dir = Path(segments_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    segments_dir.mkdir(parents=True, exist_ok=True)
-
+    if save_segments:
+        segments_dir.mkdir(parents=True, exist_ok=True)
 
     # Process each audio file
-    audio_files = list(audio_dir.glob("*.wav")) + list(audio_dir.glob("*.mp3")) + list(audio_dir.glob("*.flac")) + list(audio_dir.glob("*.ogg"))
+    audio_files = list(audio_dir.glob("*.wav")) + list(audio_dir.glob("*.mp3")) + \
+        list(audio_dir.glob("*.flac")) + list(audio_dir.glob("*.ogg"))
     print(f"\nFound {len(audio_files)} audio files")
 
-    embeddings_dict = {}
     total = len(audio_files)
+    processed_files: list[str] = []
 
-    for i, audio_file in enumerate(audio_files, 1):
-        print(f"\rProcessing {i}/{total}: {audio_file.name[:30]:<30}", end="", flush=True)
+    if total == 0:
+        return processed_files
+    log_interval = max(1, total // 100)  # Log every 1% of files
+    for audio_idx, audio_file in enumerate(audio_files):
+        if (audio_idx + 1) % log_interval == 0 or audio_idx == total - 1:
+            print(f"Processing file {audio_idx + 1}/{total}: {audio_file.name}")
+        # Use bacpipe's official per-file pipeline.
+        # This route applies model-specific preparation and memory handling.
+        try:
+            batched_embeddings = embedder.get_embeddings_from_model(audio_file)
+        except Exception as exc:
+            logger.warning("Skipping %s due to embedding error: %s", audio_file, exc)
+            continue
 
-        # Step 1: Load and resample audio
-        audio = embedder.model.load_and_resample(audio_file)
-        audio = audio.to(embedder.model.device)
+        segment_duration = float(embedder.model.segment_length) / float(embedder.model.sr)
+        waveform = None
+        original_sr = None
+        samples_per_segment = None
 
-        # Step 2: Window audio into segments
-        frames = embedder.model.window_audio(audio)
-        num_segments = frames.shape[0]
-        segment_duration = embedder.model.segment_length / embedder.model.sr
+        if save_segments:
+            try:
+                waveform, original_sr = sf.read(audio_file)
+            except (RuntimeError, OSError, ValueError) as exc:
+                logger.warning("Skipping %s due to audio read error: %s", audio_file, exc)
+                continue
 
-        # print(f"  Segments: {num_segments} x {segment_duration:.1f}s")
+            samples_per_segment = max(
+                1, int(round(segment_duration * float(original_sr)))
+            )
 
-        # Step 3: Save each segment as individual audio file
-        segment_files = []
-        for i, segment in enumerate(frames):
-            start_time = int(segment_duration * i)
-            end_time = int(segment_duration * (i + 1))
-            segment_filename = f"{audio_file.stem}_{start_time:03d}_{end_time:03d}.wav"
-            segment_path = segments_dir / segment_filename
-            # Save as mono wav at model's sample rate
-            ta.save(segment_path, segment.unsqueeze(0).cpu(), embedder.model.sr)
-            segment_files.append(segment_path)
-        # print(f"  Saved {num_segments} segments to {segments_dir}/")
+        if batched_embeddings.ndim == 1:
+            batched_embeddings = np.expand_dims(batched_embeddings, axis=0)
 
-        # Step 4: Compute embeddings on individual segments and save each separately
-        segment_embeddings = []
-        for segment_path in segment_files:
-            # Load segment, preprocess, and get embedding
-            preprocessed = embedder.prepare_audio(segment_path)
-            embedding = embedder.get_embeddings_for_audio(preprocessed)
-
-            # Ensure 1D shape for single segment embedding
-            if embedding.ndim > 1:
-                embedding = embedding.squeeze()
-
+        # Step 4: Save per-segment embeddings with time-based filenames
+        for segment_index, embedding in enumerate(batched_embeddings):
+            start_time = int(segment_duration * segment_index)
+            end_time = int(segment_duration * (segment_index + 1))
+            segment_filename = f"{audio_file.stem}_{start_time:04d}_{end_time:04d}.wav"
             # Save individual embedding file (matching segment filename)
-            embedding_file = output_dir / f"{segment_path.stem}_{model_name}.npy"
+            embedding_file = output_dir / f"{Path(segment_filename).stem}_{model_name}.npy"
             np.save(embedding_file, embedding)
-            segment_embeddings.append((segment_path.name, embedding))
 
-        # print(f"  Saved {len(segment_embeddings)} embeddings to {output_dir}/")
-        # print(f"  Embedding dim: {segment_embeddings[0][1].shape[0]}")
+            if save_segments:
+                start_sample = segment_index * samples_per_segment
+                end_sample = start_sample + samples_per_segment
+                segment_waveform = waveform[start_sample:end_sample]
 
-        embeddings_dict[audio_file.name] = segment_embeddings
-    return embeddings_dict
+                if segment_waveform.shape[0] < samples_per_segment:
+                    if np.ndim(waveform) == 1:
+                        pad_width = (0, samples_per_segment - segment_waveform.shape[0])
+                    else:
+                        pad_width = (
+                            (0, samples_per_segment - segment_waveform.shape[0]),
+                            (0, 0),
+                        )
+                    segment_waveform = np.pad(
+                        segment_waveform,
+                        pad_width,
+                        mode="constant",
+                        constant_values=0,
+                    )
+
+                segment_file = segments_dir / segment_filename
+                sf.write(segment_file, segment_waveform, int(original_sr))
+
+        processed_files.append(audio_file.name)
+
+    return processed_files
